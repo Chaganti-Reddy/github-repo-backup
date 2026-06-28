@@ -46,7 +46,15 @@ param(
     [switch]$Bundle,
 
     # Also download all Git LFS objects (large files) into each mirror. Needs git-lfs installed.
-    [switch]$Lfs
+    [switch]$Lfs,
+
+    # Also mirror each repo's Wiki (wikis are separate git repos). Skips repos with no wiki.
+    [switch]$Wiki,
+
+    # Also dump issues, pull requests, releases, labels, milestones, comments as JSON.
+    # NOTE: this data is NOT git. It is saved for safekeeping; redeploying it to another
+    # server is target-specific and lossy (see README). Needs the 'repo' token scope.
+    [switch]$Meta
 )
 
 $ErrorActionPreference = "Stop"
@@ -136,6 +144,54 @@ $apiHeaders = @{
     "User-Agent"           = "ps-github-backup"
 }
 
+# Fetch every page of a GitHub list endpoint and return the combined array.
+# $PathQuery is everything after https://api.github.com/  e.g. "repos/me/x/issues?state=all"
+function Get-AllPages {
+    param([string]$PathQuery)
+    $all = @()
+    $page = 1
+    do {
+        $sep = if ($PathQuery -match '\?') { '&' } else { '?' }
+        $uri = "https://api.github.com/$PathQuery${sep}per_page=100&page=$page"
+        $batch = Invoke-RestMethod -Uri $uri -Headers $apiHeaders
+        if ($batch.Count -gt 0) { $all += $batch }
+        $page++
+    } while ($batch.Count -eq 100)
+    return $all
+}
+
+# Dump all issues/PRs/releases/etc for one repo as JSON files under <repoDir-without-.git>.meta\
+function Save-RepoMetadata {
+    param([string]$Owner, [string]$Name, [string]$OutDir)
+
+    New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
+    $base = "repos/$Owner/$Name"
+
+    # endpoint name -> file name. "issues" with state=all includes PRs too (GitHub treats
+    # PRs as issues); the separate "pulls" pull adds PR-specific fields (branches, merge state).
+    $targets = @{
+        "issues.json"           = "$base/issues?state=all"
+        "pulls.json"            = "$base/pulls?state=all"
+        "issue_comments.json"   = "$base/issues/comments"
+        "releases.json"         = "$base/releases"
+        "labels.json"           = "$base/labels"
+        "milestones.json"       = "$base/milestones?state=all"
+    }
+
+    foreach ($file in $targets.Keys) {
+        try {
+            $data = Get-AllPages $targets[$file]
+            $path = Join-Path $OutDir $file
+            # depth 10 keeps nested objects (labels, user, etc); always write valid JSON array.
+            ConvertTo-Json -InputObject @($data) -Depth 10 | Set-Content -Path $path -Encoding UTF8
+        }
+        catch {
+            # e.g. issues disabled on the repo -> just note it, don't fail the whole repo.
+            Log "  meta: skip $file for $Owner/$Name ($($_.Exception.Message))" "WARN"
+        }
+    }
+}
+
 # ----------------------------------------------------------------------------
 # 2. Verify token + identify user
 # ----------------------------------------------------------------------------
@@ -215,6 +271,35 @@ foreach ($r in $repos) {
             git -c "http.extraHeader=$authHeader" -C $repoDir lfs fetch --all 2>&1 |
                 Tee-Object -FilePath $logFile -Append | Out-Null
             if ($LASTEXITCODE -ne 0) { throw "git lfs fetch failed (code $LASTEXITCODE)" }
+        }
+
+        # Optional: mirror the repo's Wiki. Wikis are their own git repo at <repo>.wiki.git.
+        # Many repos have no wiki -> clone fails harmlessly; we detect and skip.
+        if ($Wiki) {
+            $wikiUrl = $url -replace '\.git$', '.wiki.git'
+            $wikiDir = Join-Path $ownerDir "$name.wiki.git"
+            if (Test-Path $wikiDir) {
+                git -c "http.extraHeader=$authHeader" -C $wikiDir remote update --prune 2>&1 |
+                    Tee-Object -FilePath $logFile -Append | Out-Null
+                if ($LASTEXITCODE -ne 0) { Log "  wiki update issue for $owner/$name" "WARN" }
+                else { Log "  wiki updated" }
+            }
+            else {
+                git -c "http.extraHeader=$authHeader" clone --mirror $wikiUrl $wikiDir 2>&1 |
+                    Tee-Object -FilePath $logFile -Append | Out-Null
+                if ($LASTEXITCODE -ne 0) {
+                    Log "  no wiki for $owner/$name (skipped)"
+                    if (Test-Path $wikiDir) { Remove-Item $wikiDir -Recurse -Force }  # clean empty dir
+                }
+                else { Log "  wiki cloned" }
+            }
+        }
+
+        # Optional: dump issues/PRs/releases/labels/milestones/comments as JSON.
+        if ($Meta) {
+            Log "  saving metadata (issues/PRs/releases) ..."
+            $metaDir = Join-Path $ownerDir "$name.meta"
+            Save-RepoMetadata -Owner $owner -Name $name -OutDir $metaDir
         }
 
         # Optional: single-file portable snapshot of everything.

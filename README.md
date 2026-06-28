@@ -130,8 +130,15 @@ chmod +x backup-github-repos.sh        # first time only
 | `-Destination <path>` | `-d <path>` | Where to store backups. Omit → interactive picker. |
 | `-Bundle` | `--bundle` | Also write a single-file `<repo>.bundle` per repo. |
 | `-Lfs` | `--lfs` | Also download Git LFS large files (needs git-lfs). |
+| `-Wiki` | `--wiki` | Also mirror each repo's Wiki (wikis are separate git repos; repos without one are skipped). |
+| `-Meta` | `--meta` | Also dump issues, PRs, releases, labels, milestones, comments as JSON. See [Issues, PRs & metadata](#issues-prs--metadata). |
 | `-Affiliation <list>` | `-a <list>` | Which repos to include. Default `owner,collaborator,organization_member`. |
 | `-Token <pat>` | *(env/prompt only)* | Pass the PAT inline (not recommended; prefer env var). |
+
+Full backup, everything on:
+```powershell
+.\Backup-GitHubRepos.ps1 -Destination "E:\GitHubBackup" -Lfs -Wiki -Meta -Bundle
+```
 
 ---
 
@@ -214,6 +221,44 @@ If some repos store large binaries via **Git LFS**, a plain mirror copies only t
 *pointer files*, not the actual large content. Pass `-Lfs` / `--lfs` to download the real
 files too. Harmless to always enable — if a repo uses no LFS, there's simply nothing extra
 to fetch. Requires **git-lfs** installed; if missing, the script warns and continues without it.
+
+---
+
+## Issues, PRs & metadata
+
+Code, history, branches, tags, and **wikis** are all *git data* — a mirror copies them
+perfectly and you can push them to any server, exactly as they were.
+
+**Issues, pull requests, releases, labels, milestones, and comments are NOT git data.**
+They live in GitHub's own database. Pass `-Meta` to save them as JSON for safekeeping:
+
+```
+E:\GitHubBackup\your-username\project-a.meta\
+├─ issues.json          (open + closed; includes PRs, which GitHub models as issues)
+├─ pulls.json           (PR-specific fields: branches, merge state)
+├─ issue_comments.json
+├─ releases.json
+├─ labels.json
+└─ milestones.json
+```
+
+This JSON is a faithful, readable record — if GitHub disappears, you still have all of it.
+
+### Redeploying metadata to another server — read this
+
+Restoring issues/PRs into a *different* server is **possible but lossy**, because there is
+no universal format and PRs are tightly bound to commits, branches, review state, and
+author identities that don't transfer cleanly. Set expectations accordingly:
+
+| What you want | Best path | Fidelity |
+|---------------|-----------|----------|
+| Move **code + wiki** to a new server | `git push --mirror` to the new remote | **Exact** |
+| Move **issues/PRs/releases** to a new GitHub repo | Custom script using the GitHub REST API to re-create them from the JSON | Good, but you become the author and timestamps/links shift |
+| Move **everything** to **Gitea** | Gitea's built-in *GitHub Migration* (reads issues/PRs/releases straight from GitHub and recreates them) | Best available — purpose-built |
+
+**Recommendation:** treat the `-Meta` JSON as an *archive* you'll always have, not as a
+one-click restore. If you ever truly need issues/PRs live on a new host, Gitea's migration
+is the least painful route; recreating into GitHub via the API works but is manual and lossy.
 
 ---
 

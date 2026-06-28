@@ -24,7 +24,16 @@
 # USAGE:
 #     ./backup-github-repos.sh -d /mnt/usb/GitHubBackup
 #     ./backup-github-repos.sh -d /mnt/usb/GitHubBackup --bundle
+#     ./backup-github-repos.sh -d /mnt/usb/GitHubBackup --lfs --wiki --meta --bundle
 #     ./backup-github-repos.sh -d /mnt/usb/GitHubBackup -a "owner,collaborator,organization_member"
+#
+# FLAGS:
+#     -d|--destination PATH   where to store backups (omit -> interactive prompt)
+#     -a|--affiliation LIST   which repos: owner,collaborator,organization_member
+#     --bundle                also write a single-file <repo>.bundle per repo
+#     --lfs                   also download Git LFS large files (needs git-lfs)
+#     --wiki                  also mirror each repo's wiki (skips repos with none)
+#     --meta                  also dump issues/PRs/releases/labels/milestones/comments as JSON
 #
 set -euo pipefail
 
@@ -35,6 +44,8 @@ DEST=""
 AFFILIATION="owner,collaborator,organization_member"
 MAKE_BUNDLE=0
 MAKE_LFS=0
+MAKE_WIKI=0
+MAKE_META=0
 
 usage() {
     grep '^#' "$0" | sed 's/^#//'
@@ -47,6 +58,8 @@ while [[ $# -gt 0 ]]; do
         -a|--affiliation) AFFILIATION="$2"; shift 2 ;;
         --bundle)         MAKE_BUNDLE=1; shift ;;
         --lfs)            MAKE_LFS=1; shift ;;
+        --wiki)           MAKE_WIKI=1; shift ;;
+        --meta)           MAKE_META=1; shift ;;
         -h|--help)        usage ;;
         *) echo "Unknown arg: $1" >&2; usage ;;
     esac
@@ -109,6 +122,47 @@ api_get() {
         -H "X-GitHub-Api-Version: 2022-11-28" \
         -H "User-Agent: bash-github-backup" \
         "$1"
+}
+
+# Fetch every page of a list endpoint, print one combined JSON array to stdout.
+# $1 = path+query after the api root, e.g. "repos/me/x/issues?state=all"
+api_get_all() {
+    local pathq="$1" page=1 sep batch out="[]"
+    while :; do
+        case "$pathq" in *\?*) sep='&' ;; *) sep='?' ;; esac
+        batch="$(api_get "$API/${pathq}${sep}per_page=100&page=$page")" || return 1
+        local n; n="$(echo "$batch" | jq 'length')"
+        [[ "$n" -eq 0 ]] && break
+        out="$(jq -s 'add' <(echo "$out") <(echo "$batch"))"
+        [[ "$n" -lt 100 ]] && break
+        page=$((page + 1))
+    done
+    echo "$out"
+}
+
+# Dump issues/PRs/releases/labels/milestones/comments for one repo into $3 (a dir).
+save_repo_metadata() {
+    local owner="$1" name="$2" outdir="$3"
+    mkdir -p "$outdir"
+    local base="repos/$owner/$name"
+    # file:endpoint pairs. "issues?state=all" includes PRs (GitHub models PRs as issues);
+    # "pulls" adds PR-specific fields. A failing endpoint (e.g. issues disabled) is skipped.
+    local pairs="issues.json:$base/issues?state=all
+pulls.json:$base/pulls?state=all
+issue_comments.json:$base/issues/comments
+releases.json:$base/releases
+labels.json:$base/labels
+milestones.json:$base/milestones?state=all"
+    local line file ep
+    while IFS= read -r line; do
+        file="${line%%:*}"; ep="${line#*:}"
+        if data="$(api_get_all "$ep")"; then
+            echo "$data" > "$outdir/$file"
+        else
+            log "  meta: skip $file for $owner/$name" "WARN"
+        fi
+    done <<< "$pairs"
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -176,6 +230,29 @@ while IFS=$'\t' read -r owner name url; do
 
         if [[ "$MAKE_LFS" -eq 1 ]]; then
             git -c "http.extraHeader=$AUTH_HEADER" -C "$repo_dir" lfs fetch --all >>"$LOG_FILE" 2>&1
+        fi
+
+        # Wiki: separate git repo at <repo>.wiki.git. Many repos have none -> skip cleanly.
+        if [[ "$MAKE_WIKI" -eq 1 ]]; then
+            wiki_url="${url%.git}.wiki.git"
+            wiki_dir="$owner_dir/$name.wiki.git"
+            if [[ -d "$wiki_dir" ]]; then
+                git -c "http.extraHeader=$AUTH_HEADER" -C "$wiki_dir" remote update --prune >>"$LOG_FILE" 2>&1 \
+                    && log "  wiki updated" || log "  wiki update issue for $owner/$name" "WARN"
+            else
+                if git -c "http.extraHeader=$AUTH_HEADER" clone --mirror "$wiki_url" "$wiki_dir" >>"$LOG_FILE" 2>&1; then
+                    log "  wiki cloned"
+                else
+                    log "  no wiki for $owner/$name (skipped)"
+                    rm -rf "$wiki_dir"   # remove empty/partial dir
+                fi
+            fi
+        fi
+
+        # Metadata: issues/PRs/releases/etc as JSON (NOT git data; see README on redeploy).
+        if [[ "$MAKE_META" -eq 1 ]]; then
+            log "  saving metadata (issues/PRs/releases) ..."
+            save_repo_metadata "$owner" "$name" "$owner_dir/$name.meta"
         fi
 
         if [[ "$MAKE_BUNDLE" -eq 1 ]]; then
